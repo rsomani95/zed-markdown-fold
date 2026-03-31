@@ -159,6 +159,7 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut blockquote_start: Option<u32> = None;
     let mut table_start: Option<u32> = None;
     let mut indented_code_start: Option<u32> = None;
+    let mut html_block_start: Option<(u32, String)> = None; // (start_line, tag_name)
 
     for (i, line) in lines.iter().enumerate().skip(loop_start) {
         let line_num = i as u32;
@@ -190,6 +191,25 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
             continue;
         }
 
+        // HTML block: check for closing tag if we're inside one
+        if let Some((html_start, ref tag)) = html_block_start {
+            let close_pattern = format!("</{}", tag);
+            if trimmed.to_lowercase().contains(&close_pattern) {
+                if line_num > html_start {
+                    ranges.push(FoldingRange {
+                        start_line: html_start,
+                        start_character: None,
+                        end_line: line_num,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("<...>".into()),
+                    });
+                }
+                html_block_start = None;
+                continue;
+            }
+        }
+
         // Heading detection
         if let Some(level) = heading_level(trimmed) {
             // Close any open blockquote before this heading
@@ -217,6 +237,20 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                         end_character: None,
                         kind: Some(FoldingRangeKind::Region),
                         collapsed_text: Some("| ...".into()),
+                    });
+                }
+            }
+            // Close any open HTML block before this heading
+            if let Some((html_start, _)) = html_block_start.take() {
+                let end = last_non_blank(html_start as usize + 1, i, &lines);
+                if end > html_start {
+                    ranges.push(FoldingRange {
+                        start_line: html_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("<...>".into()),
                     });
                 }
             }
@@ -302,6 +336,19 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                 }
             }
         }
+
+        // HTML block detection: opening tag (only if not already in an HTML block)
+        if html_block_start.is_none() {
+            if let Some(tag) = extract_html_block_tag(trimmed) {
+                // Check if this is a self-closing tag or single-line block
+                let close_pattern = format!("</{}", tag);
+                if trimmed.contains("/>") || trimmed.to_lowercase().contains(&close_pattern) {
+                    // Self-closing or single-line: don't create a fold
+                } else {
+                    html_block_start = Some((line_num, tag));
+                }
+            }
+        }
     }
 
     // Close remaining blockquote at end of file
@@ -330,6 +377,21 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                 end_character: None,
                 kind: Some(FoldingRangeKind::Region),
                 collapsed_text: Some("| ...".into()),
+            });
+        }
+    }
+
+    // Close remaining HTML block at end of file
+    if let Some((html_start, _)) = html_block_start {
+        let end = last_non_blank(html_start as usize + 1, lines.len(), &lines);
+        if end > html_start {
+            ranges.push(FoldingRange {
+                start_line: html_start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("<...>".into()),
             });
         }
     }
@@ -386,6 +448,38 @@ fn heading_level(line: &str) -> Option<usize> {
     // Must be followed by a space or be just `#` characters
     if line.len() == level || line.as_bytes()[level] == b' ' {
         Some(level)
+    } else {
+        None
+    }
+}
+
+/// If the trimmed line starts with an HTML block-level opening tag, returns the
+/// lowercase tag name. Returns None for non-block tags or lines that don't start
+/// with `<` followed by an alphabetic character.
+fn extract_html_block_tag(trimmed: &str) -> Option<String> {
+    const BLOCK_TAGS: &[&str] = &[
+        "div", "section", "article", "nav", "aside", "header", "footer",
+        "main", "details", "summary", "table", "thead", "tbody", "tfoot",
+        "tr", "pre", "blockquote", "figure", "figcaption", "form",
+        "fieldset", "dl", "ol", "ul",
+    ];
+
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+    let after_lt = &trimmed[1..];
+    if after_lt.is_empty() || !after_lt.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    // Extract tag name: chars until space, '>', '/', or end
+    let tag: String = after_lt
+        .chars()
+        .take_while(|&c| c != ' ' && c != '>' && c != '/')
+        .collect::<String>()
+        .to_lowercase();
+
+    if BLOCK_TAGS.contains(&tag.as_str()) {
+        Some(tag)
     } else {
         None
     }
@@ -658,5 +752,59 @@ More text";
             .filter(|r| r.collapsed_text.as_deref() == Some("    ..."))
             .collect();
         assert!(ic_ranges_single.is_empty());
+    }
+
+    #[test]
+    fn test_html_block_folding() {
+        // A <div>...</div> spanning 3 lines creates a fold
+        let text = "\
+<div class=\"wrapper\">
+  <p>Content</p>
+</div>";
+
+        let ranges = compute_folding_ranges(text);
+        let html_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("<...>"))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(html_ranges, vec![(0, 2)]);
+
+        // A <details>...</details> block creates a fold
+        let text_details = "\
+# Heading
+
+<details>
+<summary>Click</summary>
+Content here.
+</details>
+
+More text";
+
+        let ranges_details = compute_folding_ranges(text_details);
+        let html_ranges_details: Vec<_> = ranges_details
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("<...>"))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // <details> from line 2 to line 5
+        assert_eq!(html_ranges_details, vec![(2, 5)]);
+
+        // A single-line <br/> does NOT create a fold
+        let text_br = "\
+# Heading
+
+<br/>
+
+More text";
+
+        let ranges_br = compute_folding_ranges(text_br);
+        let html_ranges_br: Vec<_> = ranges_br
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("<...>"))
+            .collect();
+        assert!(html_ranges_br.is_empty());
     }
 }
