@@ -131,13 +131,34 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let lines: Vec<&str> = text.lines().collect();
     let mut ranges = Vec::new();
 
+    // Front matter detection: must start at line 0 with `---`
+    let loop_start = if lines.first().map(|l| l.trim()) == Some("---") {
+        if let Some(j) = lines.iter().enumerate().skip(1).find_map(|(idx, l)| {
+            if l.trim() == "---" { Some(idx) } else { None }
+        }) {
+            ranges.push(FoldingRange {
+                start_line: 0,
+                start_character: None,
+                end_line: j as u32,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("---".into()),
+            });
+            j + 1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // First pass: identify headings and code blocks
     let mut headings: Vec<(u32, usize)> = Vec::new(); // (line_number, level)
     let mut in_code_block = false;
     let mut code_block_start: u32 = 0;
     let mut blockquote_start: Option<u32> = None;
 
-    for (i, line) in lines.iter().enumerate() {
+    for (i, line) in lines.iter().enumerate().skip(loop_start) {
         let line_num = i as u32;
         let trimmed = line.trim();
 
@@ -397,5 +418,52 @@ some code
             .collect();
 
         assert!(code_ranges.contains(&(0, 2)));
+    }
+
+    #[test]
+    fn test_front_matter_folding() {
+        // Front matter at start of file should fold
+        let text = "\
+---
+title: My Doc
+date: 2024-01-01
+---
+
+# Heading
+
+Some content";
+
+        let ranges = compute_folding_ranges(text);
+        let fm_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("---"))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Front matter from line 0 to line 3
+        assert_eq!(fm_ranges, vec![(0, 3)]);
+
+        // Heading should still fold correctly
+        let heading_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.is_none())
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+        assert!(heading_ranges.contains(&(5, 7)));
+
+        // --- NOT at line 0 should NOT create a front matter fold
+        let text_no_fm = "\
+# Heading
+
+---
+
+Some content";
+
+        let ranges_no_fm = compute_folding_ranges(text_no_fm);
+        let fm_ranges_no_fm: Vec<_> = ranges_no_fm
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("---"))
+            .collect();
+        assert!(fm_ranges_no_fm.is_empty());
     }
 }
