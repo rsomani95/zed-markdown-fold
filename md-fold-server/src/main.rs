@@ -160,6 +160,7 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut table_start: Option<u32> = None;
     let mut indented_code_start: Option<u32> = None;
     let mut html_block_start: Option<(u32, String)> = None; // (start_line, tag_name)
+    let mut list_start: Option<u32> = None;
 
     for (i, line) in lines.iter().enumerate().skip(loop_start) {
         let line_num = i as u32;
@@ -212,6 +213,20 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
 
         // Heading detection
         if let Some(level) = heading_level(trimmed) {
+            // Close any open list before this heading
+            if let Some(ls_start) = list_start.take() {
+                let end = last_non_blank(ls_start as usize + 1, i, &lines);
+                if end > ls_start {
+                    ranges.push(FoldingRange {
+                        start_line: ls_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("- ...".into()),
+                    });
+                }
+            }
             // Close any open blockquote before this heading
             if let Some(bq_start) = blockquote_start.take() {
                 let end = last_non_blank(bq_start as usize + 1, i, &lines);
@@ -314,6 +329,36 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
             }
         }
 
+        // List detection (before indented code — nested list items are indented
+        // but should not be treated as indented code blocks)
+        if is_list_item_start(trimmed) {
+            if list_start.is_none() {
+                list_start = Some(line_num);
+            }
+            continue;
+        } else if list_start.is_some() {
+            // Inside a list: indented lines are continuations/nested items,
+            // blank lines are loose-list separators — both extend the list.
+            let is_indented = line.starts_with(' ') || line.starts_with('\t');
+            if trimmed.is_empty() || is_indented {
+                continue;
+            }
+            // Non-blank, non-indented, non-list-item line: close the list
+            if let Some(ls_start) = list_start.take() {
+                let end = last_non_blank(ls_start as usize + 1, i, &lines);
+                if end > ls_start {
+                    ranges.push(FoldingRange {
+                        start_line: ls_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("- ...".into()),
+                    });
+                }
+            }
+        }
+
         // Indented code block detection (4+ spaces or tab)
         let is_indented = line.starts_with("    ") || line.starts_with('\t');
         if is_indented {
@@ -348,6 +393,21 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                     html_block_start = Some((line_num, tag));
                 }
             }
+        }
+    }
+
+    // Close remaining list at end of file
+    if let Some(ls_start) = list_start {
+        let end = last_non_blank(ls_start as usize + 1, lines.len(), &lines);
+        if end > ls_start {
+            ranges.push(FoldingRange {
+                start_line: ls_start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("- ...".into()),
+            });
         }
     }
 
@@ -434,6 +494,27 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     }
 
     ranges
+}
+
+/// Returns true if the trimmed line starts a list item (unordered or ordered).
+fn is_list_item_start(trimmed: &str) -> bool {
+    // Unordered: `- `, `* `, `+ `
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    // Ordered: digits followed by `.` or `)` then a space
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
+        i += 1;
+        if i < bytes.len() && bytes[i] == b' ' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns the heading level (1-6) if the line is an ATX heading, None otherwise.
@@ -806,5 +887,107 @@ More text";
             .filter(|r| r.collapsed_text.as_deref() == Some("<...>"))
             .collect();
         assert!(html_ranges_br.is_empty());
+    }
+
+    #[test]
+    fn test_list_folding() {
+        // Simple 3-item unordered list creates a fold
+        let text = "\
+- Item one
+- Item two
+- Item three
+
+Some text after";
+
+        let ranges = compute_folding_ranges(text);
+        let list_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("- ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(list_ranges, vec![(0, 2)]);
+
+        // Nested list creates a single fold covering the whole block
+        let text_nested = "\
+- Parent one
+  - Child A
+  - Child B
+- Parent two
+
+Done";
+
+        let ranges_nested = compute_folding_ranges(text_nested);
+        let list_ranges_nested: Vec<_> = ranges_nested
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("- ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(list_ranges_nested, vec![(0, 3)]);
+
+        // Ordered list creates a fold
+        let text_ordered = "\
+1. First
+2. Second
+3. Third
+
+Paragraph";
+
+        let ranges_ordered = compute_folding_ranges(text_ordered);
+        let list_ranges_ordered: Vec<_> = ranges_ordered
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("- ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(list_ranges_ordered, vec![(0, 2)]);
+
+        // A single list item does NOT create a fold
+        let text_single = "\
+- Only item
+
+More text";
+
+        let ranges_single = compute_folding_ranges(text_single);
+        let list_ranges_single: Vec<_> = ranges_single
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("- ..."))
+            .collect();
+
+        assert!(list_ranges_single.is_empty());
+
+        // Loose list (blank lines between items) stays as one fold
+        let text_loose = "\
+- Item one
+
+- Item two
+
+- Item three
+
+After";
+
+        let ranges_loose = compute_folding_ranges(text_loose);
+        let list_ranges_loose: Vec<_> = ranges_loose
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("- ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(list_ranges_loose, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn test_is_list_item_start() {
+        assert!(is_list_item_start("- item"));
+        assert!(is_list_item_start("* item"));
+        assert!(is_list_item_start("+ item"));
+        assert!(is_list_item_start("1. item"));
+        assert!(is_list_item_start("10. item"));
+        assert!(is_list_item_start("1) item"));
+        assert!(!is_list_item_start("not a list"));
+        assert!(!is_list_item_start("-no space"));
+        assert!(!is_list_item_start(""));
+        assert!(!is_list_item_start("1.no space"));
     }
 }
