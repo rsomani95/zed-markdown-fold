@@ -4,10 +4,7 @@ version = "0.1.0"
 schema_version = 1
 description = "Markdown heading section folding, code block folding, and blockquote folding"
 authors = ["Rahul Somani"]
-
-[lib]
-kind = "Rust"
-version = "0.2.0"
+repository = "https://github.com/rsomani95/zed-markdown-fold"
 
 [language_servers.md-fold-server]
 language = "Markdown"
