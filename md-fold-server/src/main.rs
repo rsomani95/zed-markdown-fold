@@ -157,6 +157,7 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut in_code_block = false;
     let mut code_block_start: u32 = 0;
     let mut blockquote_start: Option<u32> = None;
+    let mut table_start: Option<u32> = None;
 
     for (i, line) in lines.iter().enumerate().skip(loop_start) {
         let line_num = i as u32;
@@ -204,8 +205,42 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                     });
                 }
             }
+            // Close any open table before this heading
+            if let Some(tbl_start) = table_start.take() {
+                if line_num - tbl_start >= 2 {
+                    let end = last_non_blank(tbl_start as usize + 1, i, &lines);
+                    ranges.push(FoldingRange {
+                        start_line: tbl_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("| ...".into()),
+                    });
+                }
+            }
             headings.push((line_num, level));
             continue;
+        }
+
+        // Table detection: consecutive lines starting with '|'
+        if trimmed.starts_with('|') {
+            if table_start.is_none() {
+                table_start = Some(line_num);
+            }
+            continue;
+        } else if let Some(tbl_start) = table_start.take() {
+            if line_num - tbl_start >= 2 {
+                let end = last_non_blank(tbl_start as usize + 1, i, &lines);
+                ranges.push(FoldingRange {
+                    start_line: tbl_start,
+                    start_character: None,
+                    end_line: end,
+                    end_character: None,
+                    kind: Some(FoldingRangeKind::Region),
+                    collapsed_text: Some("| ...".into()),
+                });
+            }
         }
 
         // Blockquote detection
@@ -242,6 +277,21 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                 end_character: None,
                 kind: Some(FoldingRangeKind::Region),
                 collapsed_text: Some("> ...".into()),
+            });
+        }
+    }
+
+    // Close remaining table at end of file
+    if let Some(tbl_start) = table_start {
+        let end = last_non_blank(tbl_start as usize + 1, lines.len(), &lines);
+        if end > tbl_start && end - tbl_start >= 2 {
+            ranges.push(FoldingRange {
+                start_line: tbl_start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("| ...".into()),
             });
         }
     }
@@ -465,5 +515,45 @@ Some content";
             .filter(|r| r.collapsed_text.as_deref() == Some("---"))
             .collect();
         assert!(fm_ranges_no_fm.is_empty());
+    }
+
+    #[test]
+    fn test_table_folding() {
+        // A 5-line table (header + separator + 3 rows) should create a fold
+        let text = "\
+# Heading
+
+| Column A | Column B |
+|----------|----------|
+| a1       | b1       |
+| a2       | b2       |
+| a3       | b3       |
+
+Some text after";
+
+        let ranges = compute_folding_ranges(text);
+        let table_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("| ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Table from line 2 to line 6
+        assert_eq!(table_ranges, vec![(2, 6)]);
+
+        // A single pipe line should NOT create a fold
+        let text_single = "\
+# Heading
+
+| just one line
+
+More text";
+
+        let ranges_single = compute_folding_ranges(text_single);
+        let table_ranges_single: Vec<_> = ranges_single
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("| ..."))
+            .collect();
+        assert!(table_ranges_single.is_empty());
     }
 }
