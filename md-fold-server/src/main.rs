@@ -158,6 +158,7 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut code_block_start: u32 = 0;
     let mut blockquote_start: Option<u32> = None;
     let mut table_start: Option<u32> = None;
+    let mut indented_code_start: Option<u32> = None;
 
     for (i, line) in lines.iter().enumerate().skip(loop_start) {
         let line_num = i as u32;
@@ -219,6 +220,20 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                     });
                 }
             }
+            // Close any open indented code block before this heading
+            if let Some(ic_start) = indented_code_start.take() {
+                let end = last_non_blank(ic_start as usize + 1, i, &lines);
+                if end > ic_start {
+                    ranges.push(FoldingRange {
+                        start_line: ic_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("    ...".into()),
+                    });
+                }
+            }
             headings.push((line_num, level));
             continue;
         }
@@ -264,6 +279,29 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                 }
             }
         }
+
+        // Indented code block detection (4+ spaces or tab)
+        let is_indented = line.starts_with("    ") || line.starts_with('\t');
+        if is_indented {
+            if indented_code_start.is_none() {
+                indented_code_start = Some(line_num);
+            }
+        } else if !trimmed.is_empty() {
+            // Non-blank, non-indented line ends an indented code block
+            if let Some(ic_start) = indented_code_start.take() {
+                let end = last_non_blank(ic_start as usize + 1, i, &lines);
+                if end > ic_start {
+                    ranges.push(FoldingRange {
+                        start_line: ic_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("    ...".into()),
+                    });
+                }
+            }
+        }
     }
 
     // Close remaining blockquote at end of file
@@ -292,6 +330,21 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
                 end_character: None,
                 kind: Some(FoldingRangeKind::Region),
                 collapsed_text: Some("| ...".into()),
+            });
+        }
+    }
+
+    // Close remaining indented code block at end of file
+    if let Some(ic_start) = indented_code_start {
+        let end = last_non_blank(ic_start as usize + 1, lines.len(), &lines);
+        if end > ic_start {
+            ranges.push(FoldingRange {
+                start_line: ic_start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("    ...".into()),
             });
         }
     }
@@ -555,5 +608,55 @@ More text";
             .filter(|r| r.collapsed_text.as_deref() == Some("| ..."))
             .collect();
         assert!(table_ranges_single.is_empty());
+    }
+
+    #[test]
+    fn test_indented_code_block_folding() {
+        let text = "# Heading\n\n    first line of code\n    second line of code\n    third line of code\n\nSome text after";
+
+        let ranges = compute_folding_ranges(text);
+        let ic_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("    ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Indented code block from line 2 to line 4
+        assert_eq!(ic_ranges, vec![(2, 4)]);
+
+        // Indented code with blank lines in the middle should stay as one block
+        let text_with_blanks = "    line one\n\n    line three\n    line four";
+
+        let ranges_blanks = compute_folding_ranges(text_with_blanks);
+        let ic_ranges_blanks: Vec<_> = ranges_blanks
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("    ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Should be a single fold from line 0 to line 3
+        assert_eq!(ic_ranges_blanks, vec![(0, 3)]);
+
+        // Tab-indented code should also work
+        let text_tabs = "\tfirst line\n\tsecond line\n\tthird line";
+
+        let ranges_tabs = compute_folding_ranges(text_tabs);
+        let ic_ranges_tabs: Vec<_> = ranges_tabs
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("    ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(ic_ranges_tabs, vec![(0, 2)]);
+
+        // A single indented line should NOT create a fold
+        let text_single = "# Heading\n\n    just one line\n\nMore text";
+
+        let ranges_single = compute_folding_ranges(text_single);
+        let ic_ranges_single: Vec<_> = ranges_single
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("    ..."))
+            .collect();
+        assert!(ic_ranges_single.is_empty());
     }
 }
