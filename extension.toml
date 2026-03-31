@@ -1,6 +1,6 @@
 id = "markdown-fold"
 name = "Markdown Fold"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 description = "Markdown heading section folding, code block folding, and blockquote folding"
 authors = ["Rahul Somani"]
