@@ -1,0 +1,360 @@
+use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_types::*;
+use std::collections::HashMap;
+
+fn main() {
+    let (connection, io_threads) = Connection::stdio();
+
+    let capabilities = ServerCapabilities {
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::FULL,
+        )),
+        ..Default::default()
+    };
+
+    // connection.initialize() wraps the value in {"capabilities": ...},
+    // so pass just ServerCapabilities, not the full InitializeResult.
+    let (id, _params) = connection.initialize_start().unwrap();
+    let init_result = serde_json::to_value(InitializeResult {
+        capabilities,
+        server_info: Some(ServerInfo {
+            name: "md-fold-server".into(),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+        }),
+    })
+    .unwrap();
+    connection.initialize_finish(id, init_result).unwrap();
+
+    let mut documents: HashMap<Uri, String> = HashMap::new();
+
+    for msg in &connection.receiver {
+        match msg {
+            Message::Request(req) => {
+                if connection.handle_shutdown(&req).unwrap() {
+                    return;
+                }
+                handle_request(&req, &documents, &connection);
+            }
+            Message::Notification(notif) => {
+                handle_notification(&notif, &mut documents);
+            }
+            Message::Response(_) => {}
+        }
+    }
+
+    io_threads.join().unwrap();
+}
+
+fn handle_request(req: &Request, documents: &HashMap<Uri, String>, conn: &Connection) {
+    if req.method == "textDocument/foldingRange" {
+        let params: FoldingRangeParams = serde_json::from_value(req.params.clone()).unwrap();
+        let ranges = documents
+            .get(&params.text_document.uri)
+            .map(|text| compute_folding_ranges(text))
+            .unwrap_or_default();
+
+        let resp = Response {
+            id: req.id.clone(),
+            result: Some(serde_json::to_value(ranges).unwrap()),
+            error: None,
+        };
+        conn.sender.send(Message::Response(resp)).unwrap();
+    }
+}
+
+fn handle_notification(notif: &Notification, documents: &mut HashMap<Uri, String>) {
+    match notif.method.as_str() {
+        "textDocument/didOpen" => {
+            let params: DidOpenTextDocumentParams =
+                serde_json::from_value(notif.params.clone()).unwrap();
+            documents.insert(params.text_document.uri, params.text_document.text);
+        }
+        "textDocument/didChange" => {
+            let params: DidChangeTextDocumentParams =
+                serde_json::from_value(notif.params.clone()).unwrap();
+            if let Some(change) = params.content_changes.into_iter().last() {
+                documents.insert(params.text_document.uri, change.text);
+            }
+        }
+        "textDocument/didClose" => {
+            let params: DidCloseTextDocumentParams =
+                serde_json::from_value(notif.params.clone()).unwrap();
+            documents.remove(&params.text_document.uri);
+        }
+        _ => {}
+    }
+}
+
+fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut ranges = Vec::new();
+
+    // First pass: identify headings and code blocks
+    let mut headings: Vec<(u32, usize)> = Vec::new(); // (line_number, level)
+    let mut in_code_block = false;
+    let mut code_block_start: u32 = 0;
+    let mut blockquote_start: Option<u32> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let line_num = i as u32;
+        let trimmed = line.trim();
+
+        // Code fence detection
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if in_code_block {
+                // Closing fence
+                if line_num > code_block_start {
+                    ranges.push(FoldingRange {
+                        start_line: code_block_start,
+                        start_character: None,
+                        end_line: line_num,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("...".into()),
+                    });
+                }
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+                code_block_start = line_num;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            continue;
+        }
+
+        // Heading detection
+        if let Some(level) = heading_level(trimmed) {
+            // Close any open blockquote before this heading
+            if let Some(bq_start) = blockquote_start.take() {
+                let end = last_non_blank(bq_start as usize + 1, i, &lines);
+                if end > bq_start {
+                    ranges.push(FoldingRange {
+                        start_line: bq_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("> ...".into()),
+                    });
+                }
+            }
+            headings.push((line_num, level));
+            continue;
+        }
+
+        // Blockquote detection
+        if trimmed.starts_with('>') {
+            if blockquote_start.is_none() {
+                blockquote_start = Some(line_num);
+            }
+        } else if !trimmed.is_empty() {
+            // Non-blank, non-blockquote line ends a blockquote
+            if let Some(bq_start) = blockquote_start.take() {
+                let end = last_non_blank(bq_start as usize + 1, i, &lines);
+                if end > bq_start {
+                    ranges.push(FoldingRange {
+                        start_line: bq_start,
+                        start_character: None,
+                        end_line: end,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: Some("> ...".into()),
+                    });
+                }
+            }
+        }
+    }
+
+    // Close remaining blockquote at end of file
+    if let Some(bq_start) = blockquote_start {
+        let end = last_non_blank(bq_start as usize + 1, lines.len(), &lines);
+        if end > bq_start {
+            ranges.push(FoldingRange {
+                start_line: bq_start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: Some("> ...".into()),
+            });
+        }
+    }
+
+    // Second pass: compute heading section fold ranges
+    // Each heading folds to just before the next heading of same or higher level (or EOF)
+    for (idx, &(start_line, level)) in headings.iter().enumerate() {
+        let section_end = headings[idx + 1..]
+            .iter()
+            .find(|&&(_, l)| l <= level)
+            .map(|&(line, _)| line as usize)
+            .unwrap_or(lines.len());
+
+        let end = last_non_blank(start_line as usize + 1, section_end, &lines);
+        if end > start_line {
+            ranges.push(FoldingRange {
+                start_line,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None, // Zed shows the heading text by default
+            });
+        }
+    }
+
+    ranges
+}
+
+/// Returns the heading level (1-6) if the line is an ATX heading, None otherwise.
+fn heading_level(line: &str) -> Option<usize> {
+    if !line.starts_with('#') {
+        return None;
+    }
+    let level = line.chars().take_while(|&c| c == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    // Must be followed by a space or be just `#` characters
+    if line.len() == level || line.as_bytes()[level] == b' ' {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+/// Find the last non-blank line in range [start, end), returning its line number.
+/// Returns `start - 1` if no non-blank lines found (meaning the range is empty/blank).
+fn last_non_blank(start: usize, end: usize, lines: &[&str]) -> u32 {
+    for i in (start..end).rev() {
+        if !lines[i].trim().is_empty() {
+            return i as u32;
+        }
+    }
+    (start.saturating_sub(1)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_heading_level() {
+        assert_eq!(heading_level("# H1"), Some(1));
+        assert_eq!(heading_level("## H2"), Some(2));
+        assert_eq!(heading_level("### H3"), Some(3));
+        assert_eq!(heading_level("#### H4"), Some(4));
+        assert_eq!(heading_level("#Not a heading"), None);
+        assert_eq!(heading_level("####### Too many"), None);
+        assert_eq!(heading_level("Regular text"), None);
+        assert_eq!(heading_level(""), None);
+        assert_eq!(heading_level("#"), Some(1));
+    }
+
+    #[test]
+    fn test_heading_folding() {
+        let text = "\
+# Title
+
+Some intro text
+
+## Section A
+
+Content A
+
+## Section B
+
+Content B
+
+### Subsection B1
+
+Sub content
+
+# Another Top Level
+
+Final content";
+
+        let ranges = compute_folding_ranges(text);
+        let heading_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.is_none())
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // # Title (line 0) -> folds to line 14 (last non-blank before # Another Top Level)
+        // ## Section A (line 4) -> folds to line 6 (last non-blank before ## Section B)
+        // ## Section B (line 8) -> folds to line 14 (last non-blank before # Another Top Level)
+        // ### Subsection B1 (line 12) -> folds to line 14
+        // # Another Top Level (line 16) -> folds to line 18
+        assert!(heading_ranges.contains(&(0, 14)));
+        assert!(heading_ranges.contains(&(4, 6)));
+        assert!(heading_ranges.contains(&(8, 14)));
+        assert!(heading_ranges.contains(&(12, 14)));
+        assert!(heading_ranges.contains(&(16, 18)));
+    }
+
+    #[test]
+    fn test_code_block_folding() {
+        let text = "\
+# Heading
+
+```python
+def hello():
+    print('hi')
+```
+
+More text";
+
+        let ranges = compute_folding_ranges(text);
+        let code_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Code block from line 2 to line 5
+        assert!(code_ranges.contains(&(2, 5)));
+    }
+
+    #[test]
+    fn test_blockquote_folding() {
+        let text = "\
+# Heading
+
+> This is a blockquote
+> that spans multiple
+> lines
+
+Regular text";
+
+        let ranges = compute_folding_ranges(text);
+        let bq_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("> ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // Blockquote from line 2 to line 4
+        assert!(bq_ranges.contains(&(2, 4)));
+    }
+
+    #[test]
+    fn test_tilde_code_block() {
+        let text = "\
+~~~
+some code
+~~~";
+
+        let ranges = compute_folding_ranges(text);
+        let code_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert!(code_ranges.contains(&(0, 2)));
+    }
+}

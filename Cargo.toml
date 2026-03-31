@@ -1,0 +1,17 @@
+[package]
+name = "zed-markdown-fold"
+version = "0.1.0"
+edition = "2026"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.2.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
