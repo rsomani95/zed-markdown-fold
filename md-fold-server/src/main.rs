@@ -157,6 +157,7 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut in_code_block = false;
     let mut code_block_start: u32 = 0;
     let mut blockquote_start: Option<u32> = None;
+    let mut blockquote_saw_blank = false; // true if a blank line appeared inside a blockquote
     let mut table_start: Option<u32> = None;
     let mut indented_code_start: Option<u32> = None;
     let mut html_block_start: Option<(u32, String)> = None; // (start_line, tag_name)
@@ -307,26 +308,53 @@ fn compute_folding_ranges(text: &str) -> Vec<FoldingRange> {
             }
         }
 
-        // Blockquote detection
+        // Blockquote detection (with lazy continuation support)
         if trimmed.starts_with('>') {
             if blockquote_start.is_none() {
                 blockquote_start = Some(line_num);
             }
+            blockquote_saw_blank = false;
         } else if !trimmed.is_empty() {
-            // Non-blank, non-blockquote line ends a blockquote
-            if let Some(bq_start) = blockquote_start.take() {
-                let end = last_non_blank(bq_start as usize + 1, i, &lines);
-                if end > bq_start {
-                    ranges.push(FoldingRange {
-                        start_line: bq_start,
-                        start_character: None,
-                        end_line: end,
-                        end_character: None,
-                        kind: Some(FoldingRangeKind::Region),
-                        collapsed_text: Some("> ...".into()),
-                    });
+            if blockquote_start.is_some() {
+                // We're inside a blockquote. Check if this non-`>` line is a
+                // "block break" that should close it, or a lazy continuation
+                // that extends it. Per CommonMark, a plain text line following
+                // a `>` line is still part of the blockquote — but only when
+                // there is no intervening blank line.
+                let is_block_break = blockquote_saw_blank
+                    || heading_level(trimmed).is_some()
+                    || is_list_item_start(trimmed)
+                    || trimmed.starts_with("```") || trimmed.starts_with("~~~")
+                    || trimmed.starts_with('|')
+                    || extract_html_block_tag(trimmed).is_some();
+
+                if is_block_break {
+                    // Close the blockquote before the block element
+                    if let Some(bq_start) = blockquote_start.take() {
+                        let end = last_non_blank(bq_start as usize + 1, i, &lines);
+                        if end > bq_start {
+                            ranges.push(FoldingRange {
+                                start_line: bq_start,
+                                start_character: None,
+                                end_line: end,
+                                end_character: None,
+                                kind: Some(FoldingRangeKind::Region),
+                                collapsed_text: Some("> ...".into()),
+                            });
+                        }
+                    }
+                    blockquote_saw_blank = false;
+                } else {
+                    // Lazy continuation — line is still part of the blockquote.
+                    // Skip subsequent detectors so this line doesn't trigger
+                    // list or indented-code detection.
+                    continue;
                 }
             }
+        } else if blockquote_start.is_some() {
+            // Blank line inside a blockquote — record it so the next non-`>`
+            // line knows lazy continuation is no longer valid.
+            blockquote_saw_blank = true;
         }
 
         // List detection (before indented code — nested list items are indented
@@ -679,6 +707,55 @@ Regular text";
 
         // Blockquote from line 2 to line 4
         assert!(bq_ranges.contains(&(2, 4)));
+    }
+
+    #[test]
+    fn test_lazy_continuation_blockquote() {
+        // A lazy continuation line (no `>` prefix) is still part of the blockquote
+        let text = "\
+> Line one
+Lazy continuation
+> Line three";
+
+        let ranges = compute_folding_ranges(text);
+        let bq_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("> ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        // All three lines are one blockquote: line 0 to line 2
+        assert_eq!(bq_ranges, vec![(0, 2)]);
+
+        // Lazy continuation should NOT extend across a block-level element
+        let text_break = "\
+> Blockquote start
+# Heading breaks it";
+
+        let ranges_break = compute_folding_ranges(text_break);
+        let bq_ranges_break: Vec<_> = ranges_break
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("> ..."))
+            .collect();
+
+        // A single-line blockquote doesn't produce a fold (end == start)
+        assert!(bq_ranges_break.is_empty());
+
+        // Multiple lazy continuation lines
+        let text_multi = "\
+> First
+continued
+still going
+> Back with prefix";
+
+        let ranges_multi = compute_folding_ranges(text_multi);
+        let bq_ranges_multi: Vec<_> = ranges_multi
+            .iter()
+            .filter(|r| r.collapsed_text.as_deref() == Some("> ..."))
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+
+        assert_eq!(bq_ranges_multi, vec![(0, 3)]);
     }
 
     #[test]
