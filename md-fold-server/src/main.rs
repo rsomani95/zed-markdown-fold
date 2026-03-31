@@ -1,4 +1,4 @@
-use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::*;
 use std::collections::HashMap;
 
@@ -25,19 +25,59 @@ fn main() {
     })
     .unwrap();
     connection.initialize_finish(id, init_result).unwrap();
+    eprintln!("[md-fold-server] initialized (version {}), advertising folding_range_provider: true", env!("CARGO_PKG_VERSION"));
 
     let mut documents: HashMap<Uri, String> = HashMap::new();
+    let mut next_request_id: i32 = 1;
+    let mut dynamic_registered = false;
 
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
+                eprintln!("[md-fold-server] request: {}", req.method);
                 if connection.handle_shutdown(&req).unwrap() {
                     return;
                 }
                 handle_request(&req, &documents, &connection);
             }
             Message::Notification(notif) => {
+                eprintln!("[md-fold-server] notification: {}", notif.method);
                 handle_notification(&notif, &mut documents);
+
+                // After receiving `initialized` or `didOpen`, send dynamic
+                // registration for foldingRange. This works around a Zed bug
+                // where the client checks capabilities before the remote
+                // server's static capabilities have been propagated.
+                if !dynamic_registered
+                    && (notif.method == "initialized"
+                        || notif.method == "textDocument/didOpen")
+                {
+                    dynamic_registered = true;
+                    let registration = Registration {
+                        id: "md-fold-folding-range".into(),
+                        method: "textDocument/foldingRange".into(),
+                        register_options: Some(serde_json::to_value(
+                            TextDocumentRegistrationOptions {
+                                document_selector: Some(vec![DocumentFilter {
+                                    language: Some("markdown".into()),
+                                    scheme: None,
+                                    pattern: None,
+                                }]),
+                            },
+                        ).unwrap()),
+                    };
+                    let params = RegistrationParams {
+                        registrations: vec![registration],
+                    };
+                    let req = Request {
+                        id: RequestId::from(next_request_id),
+                        method: "client/registerCapability".into(),
+                        params: serde_json::to_value(params).unwrap(),
+                    };
+                    next_request_id += 1;
+                    eprintln!("[md-fold-server] sending dynamic registration for textDocument/foldingRange");
+                    let _ = connection.sender.send(Message::Request(req));
+                }
             }
             Message::Response(_) => {}
         }
@@ -53,6 +93,7 @@ fn handle_request(req: &Request, documents: &HashMap<Uri, String>, conn: &Connec
             .get(&params.text_document.uri)
             .map(|text| compute_folding_ranges(text))
             .unwrap_or_default();
+        eprintln!("[md-fold-server] foldingRange for {:?}: {} ranges", params.text_document.uri, ranges.len());
 
         let resp = Response {
             id: req.id.clone(),
